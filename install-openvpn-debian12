@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# Variables
+EASYRSA_PATH=/usr/share/easy-rsa/
+EASYRSA_CMD=${EASYRSA_PATH}easyrsa
+OPENVPN_CMD=/usr/sbin/openvpn
+PKI_DIR=~/easy-rsa
+CLIENT_CONFIG_DIR=~/client-configs/files
+SERVER_CONFIG_FILE=/etc/openvpn/server.conf
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Update and install required packages
+echo "Updating package list and installing OpenVPN and Easy-RSA..."
+sudo apt-get update
+sudo apt-get install -y openvpn easy-rsa
+
+# Set up Easy-RSA
+echo "Setting up Easy-RSA..."
+mkdir -p ${PKI_DIR}
+cp -r ${EASYRSA_PATH}/* ${PKI_DIR}
+cd ${PKI_DIR}
+
+# Initialize PKI and build CA
+${EASYRSA_CMD} init-pki
+${EASYRSA_CMD} build-ca nopass
+
+# Generate server certificate, key, and DH parameters
+${EASYRSA_CMD} build-server-full server nopass
+${EASYRSA_CMD} gen-dh
+${EASYRSA_CMD} gen-crl
+${OPENVPN_CMD} --genkey --secret ${PKI_DIR}/ta.key
+
+# Generate client certificate and key
+${EASYRSA_CMD} build-client-full client1 nopass
+
+# Copy server files to OpenVPN directory
+echo "Copying server configuration files..."
+sudo cp ${PKI_DIR}/pki/ca.crt /etc/openvpn/
+sudo cp ${PKI_DIR}/pki/private/server.key /etc/openvpn/
+sudo cp ${PKI_DIR}/pki/issued/server.crt /etc/openvpn/
+sudo cp ${PKI_DIR}/pki/dh.pem /etc/openvpn/
+sudo cp ${PKI_DIR}/ta.key /etc/openvpn/
+
+# Create the server configuration file
+echo "Creating server configuration file..."
+sudo tee ${SERVER_CONFIG_FILE} > /dev/null << EOF
+port 1194
+proto udp
+dev tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+tls-auth ta.key 0
+cipher AES-256-CBC
+auth SHA256
+persist-key
+persist-tun
+user nobody
+group nogroup
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 8.8.4.4"
+keepalive 10 120
+compress lz4-v2
+status openvpn-status.log
+verb 3
+EOF
+
+# Enable IP forwarding
+echo "Enabling IP forwarding..."
+sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+sudo sysctl -p
+
+# Set up firewall rules
+echo "Setting up firewall rules..."
+sudo apt-get install -y iptables-persistent
+sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/8 -o eth0 -j MASQUERADE
+sudo netfilter-persistent save
+sudo netfilter-persistent reload
+
+# Start and enable OpenVPN service
+echo "Starting and enabling OpenVPN service..."
+sudo systemctl start openvpn-server@server
+sudo systemctl enable openvpn-server@server
+
+# Generate client configuration
+echo "Generating client configuration..."
+mkdir -p ${CLIENT_CONFIG_DIR}
+chmod 700 ${CLIENT_CONFIG_DIR}
+
+BASE_CONFIG=${PKI_DIR}/base.conf
+cat > ${BASE_CONFIG} << EOF
+client
+dev tun
+proto udp
+remote your_server_ip 1194
+resolv-retry infinite
+nobind
+user nobody
+group nogroup
+persist-key
+persist-tun
+remote-cert-tls server
+tls-auth ta.key 1
+cipher AES-256-CBC
+auth SHA256
+compress lz4-v2
+verb 3
+EOF
+
+# Function to generate client .ovpn file
+generate_ovpn() {
+    CLIENT_NAME=$1
+    OUTPUT_FILE=${CLIENT_CONFIG_DIR}/${CLIENT_NAME}.ovpn
+
+    cat ${BASE_CONFIG} \
+        <(echo -e '<ca>') \
+        ${PKI_DIR}/pki/ca.crt \
+        <(echo -e '</ca>\n<cert>') \
+        ${PKI_DIR}/pki/issued/${CLIENT_NAME}.crt \
+        <(echo -e '</cert>\n<key>') \
+        ${PKI_DIR}/pki/private/${CLIENT_NAME}.key \
+        <(echo -e '</key>\n<tls-auth>') \
+        ${PKI_DIR}/ta.key \
+        <(echo -e '</tls-auth>') \
+        > ${OUTPUT_FILE
+}
+
+# Generate the .ovpn file for client1
+generate_ovpn client1
+
+echo "OpenVPN setup is complete. The client configuration file is located at: ${CLIENT_CONFIG_DIR}/client1.ovpn"
